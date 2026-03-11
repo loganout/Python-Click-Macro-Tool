@@ -42,5 +42,5 @@ Projetado para ser **simples, extensível e colaborativo**, permitindo que qualq
 Clone o repositório:
 
 ```bash
-git clone https://github.com/seuusuario/python-click-macro.git
-cd python-click-macro
+git clone https://github.com/loganout/Python-Click-Macro-Tool
+cd Python-Click-Macro-Tool

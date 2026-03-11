@@ -1,15 +1,16 @@
+import json
 import random
+import sys
 import threading
 import time
-import sys
-import json
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 try:
     import tkinter as tk
-    from tkinter import ttk, messagebox, filedialog
+    from tkinter import filedialog, messagebox, ttk
+
     TK_AVAILABLE = True
     TK_IMPORT_ERROR = None
 except ModuleNotFoundError as exc:
@@ -27,6 +28,7 @@ except ImportError:
 
 try:
     import keyboard
+
     KEYBOARD_AVAILABLE = True
 except ImportError:
     keyboard = None
@@ -86,25 +88,37 @@ def random_point_in_region(region: Region, rng: Optional[random.Random] = None) 
     return rng.randint(x1, x2), rng.randint(y1, y2)
 
 
-def save_profile(path: Path, steps: List[Step], loops: int, hotkeys_enabled: bool):
+def save_profile(
+    path: Path,
+    steps: List[Step],
+    loops: int,
+    hotkeys_enabled: bool,
+    start_delay: float,
+):
     payload = {
-        "version": 1,
+        "version": 2,
         "loops": loops,
         "hotkeys_enabled": hotkeys_enabled,
+        "start_delay": start_delay,
         "steps": [step.to_dict() for step in steps],
     }
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def load_profile(path: Path) -> Tuple[List[Step], int, bool]:
+def load_profile(path: Path) -> Tuple[List[Step], int, bool, float]:
     data = json.loads(path.read_text(encoding="utf-8"))
     loops = int(data.get("loops", 0))
     hotkeys_enabled = bool(data.get("hotkeys_enabled", True))
+    start_delay = float(data.get("start_delay", 0))
     raw_steps = data.get("steps", [])
     steps = [Step.from_dict(item) for item in raw_steps]
+
     if loops < 0:
         raise ValueError("Loops must be >= 0")
-    return steps, loops, hotkeys_enabled
+    if start_delay < 0:
+        raise ValueError("Start delay must be >= 0")
+
+    return steps, loops, hotkeys_enabled, start_delay
 
 
 class MacroEngine:
@@ -127,6 +141,7 @@ class MacroEngine:
         self,
         steps: List[Step],
         loops: int = 0,
+        start_delay: float = 0,
         on_status: Optional[Callable[[str], None]] = None,
         on_cycle: Optional[Callable[[int], None]] = None,
         on_finished: Optional[Callable[[], None]] = None,
@@ -137,6 +152,8 @@ class MacroEngine:
             raise ValueError("At least one region must be configured")
         if loops < 0:
             raise ValueError("Loops must be >= 0")
+        if start_delay < 0:
+            raise ValueError("Start delay must be >= 0")
 
         self.stop_event.clear()
         self.pause_event.clear()
@@ -144,7 +161,7 @@ class MacroEngine:
         self.completed_cycles = 0
         self.worker_thread = threading.Thread(
             target=self._run_loop,
-            args=(list(steps), loops, on_status, on_cycle, on_finished),
+            args=(list(steps), loops, start_delay, on_status, on_cycle, on_finished),
             daemon=True,
         )
         self.worker_thread.start()
@@ -169,16 +186,32 @@ class MacroEngine:
         if self.is_running and not self.stop_event.is_set() and on_status:
             on_status("executando")
 
+    def _run_start_delay(self, start_delay: float, on_status: Optional[Callable[[str], None]] = None):
+        if start_delay <= 0:
+            return
+
+        end_time = time.time() + start_delay
+        while time.time() < end_time and not self.stop_event.is_set():
+            if self.pause_event.is_set():
+                self._wait_if_paused(on_status)
+                end_time = time.time() + max(0.0, end_time - time.time())
+            remaining = max(0.0, end_time - time.time())
+            if on_status and not self.pause_event.is_set():
+                on_status(f"aguardando início ({remaining:.1f}s)")
+            self.sleep_func(0.05)
+
     def _run_loop(
         self,
         steps: List[Step],
         loops: int,
+        start_delay: float,
         on_status: Optional[Callable[[str], None]] = None,
         on_cycle: Optional[Callable[[int], None]] = None,
         on_finished: Optional[Callable[[], None]] = None,
     ):
         try:
-            if on_status:
+            self._run_start_delay(start_delay, on_status)
+            if on_status and not self.stop_event.is_set():
                 on_status("executando")
 
             cycle_target = loops if loops > 0 else None
@@ -229,7 +262,6 @@ if TK_AVAILABLE:
             self.start_x = None
             self.start_y = None
             self.rect = None
-            self.label = None
 
             self.withdraw()
             self.overrideredirect(True)
@@ -321,8 +353,8 @@ if TK_AVAILABLE:
         def __init__(self, root):
             self.root = root
             self.root.title(APP_TITLE)
-            self.root.geometry("980x640")
-            self.root.minsize(900, 560)
+            self.root.geometry("1080x660")
+            self.root.minsize(960, 580)
 
             self.steps: List[Step] = []
             self.profile_path: Optional[Path] = None
@@ -356,13 +388,17 @@ if TK_AVAILABLE:
             self.loops_var = tk.StringVar(value="0")
             ttk.Entry(topbar, textvariable=self.loops_var, width=10).grid(row=0, column=3, padx=(6, 14))
 
+            ttk.Label(topbar, text="Delay inicial (s):").grid(row=0, column=4, sticky="w")
+            self.start_delay_var = tk.StringVar(value="0")
+            ttk.Entry(topbar, textvariable=self.start_delay_var, width=10).grid(row=0, column=5, padx=(6, 14))
+
             self.hotkeys_enabled_var = tk.BooleanVar(value=True)
             ttk.Checkbutton(
                 topbar,
                 text="Atalhos globais (F6 iniciar | F7 pausar | F8 continuar | ESC parar)",
                 variable=self.hotkeys_enabled_var,
                 command=self.on_toggle_hotkeys,
-            ).grid(row=0, column=4, sticky="w")
+            ).grid(row=0, column=6, sticky="w")
 
             toolbar = ttk.Frame(main)
             toolbar.pack(fill="x", pady=(0, 10))
@@ -387,7 +423,7 @@ if TK_AVAILABLE:
             self.tree.heading("regiao", text="Região (x1, y1, x2, y2)")
             self.tree.heading("delay", text="Delay (s)")
             self.tree.column("ordem", width=50, anchor="center")
-            self.tree.column("regiao", width=490, anchor="w")
+            self.tree.column("regiao", width=540, anchor="w")
             self.tree.column("delay", width=110, anchor="center")
             self.tree.pack(side="left", fill="both", expand=True)
             self.tree.bind("<Double-1>", self.edit_delay_selected)
@@ -406,8 +442,8 @@ if TK_AVAILABLE:
 
             ttk.Label(right, textvariable=self.status_var, font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
             ttk.Label(right, textvariable=self.cycle_var).pack(anchor="w", pady=4)
-            ttk.Label(right, textvariable=self.profile_var, wraplength=220).pack(anchor="w", pady=4)
-            ttk.Label(right, textvariable=self.hotkey_status_var, wraplength=220).pack(anchor="w", pady=4)
+            ttk.Label(right, textvariable=self.profile_var, wraplength=240).pack(anchor="w", pady=4)
+            ttk.Label(right, textvariable=self.hotkey_status_var, wraplength=240).pack(anchor="w", pady=4)
 
             ttk.Separator(right, orient="horizontal").pack(fill="x", pady=10)
 
@@ -560,6 +596,12 @@ if TK_AVAILABLE:
                 raise ValueError("Loops deve ser maior ou igual a zero")
             return loops
 
+        def parse_start_delay(self) -> float:
+            try:
+                return parse_delay(self.start_delay_var.get())
+            except ValueError:
+                raise ValueError("Delay inicial deve ser um número maior ou igual a zero")
+
         def _set_status(self, value: str):
             self.root.after(0, lambda: self.status_var.set(f"Status: {value}"))
 
@@ -579,9 +621,11 @@ if TK_AVAILABLE:
 
             try:
                 loops = self.parse_loops()
+                start_delay = self.parse_start_delay()
                 self.engine.start(
                     self.steps,
                     loops=loops,
+                    start_delay=start_delay,
                     on_status=self._set_status,
                     on_cycle=self._set_cycle,
                     on_finished=self._on_finished,
@@ -615,6 +659,7 @@ if TK_AVAILABLE:
         def save_profile_dialog(self):
             try:
                 loops = self.parse_loops()
+                start_delay = self.parse_start_delay()
             except ValueError as exc:
                 messagebox.showwarning("Valor inválido", str(exc))
                 return
@@ -630,7 +675,7 @@ if TK_AVAILABLE:
 
             path = Path(path_str)
             try:
-                save_profile(path, self.steps, loops, self.hotkeys_enabled_var.get())
+                save_profile(path, self.steps, loops, self.hotkeys_enabled_var.get(), start_delay)
             except Exception as exc:
                 messagebox.showerror("Erro ao salvar", f"Não foi possível salvar o perfil:\n{exc}")
                 return
@@ -653,13 +698,14 @@ if TK_AVAILABLE:
 
             path = Path(path_str)
             try:
-                steps, loops, hotkeys_enabled = load_profile(path)
+                steps, loops, hotkeys_enabled, start_delay = load_profile(path)
             except Exception as exc:
                 messagebox.showerror("Erro ao carregar", f"Não foi possível carregar o perfil:\n{exc}")
                 return
 
             self.steps = steps
             self.loops_var.set(str(loops))
+            self.start_delay_var.set(str(start_delay))
             self.hotkeys_enabled_var.set(hotkeys_enabled)
             self.profile_path = path
             self.refresh_tree()
@@ -784,10 +830,11 @@ def run_tests():
             with tempfile.TemporaryDirectory() as temp_dir:
                 path = Path(temp_dir) / "profile.json"
                 steps = [Step(region=(10, 10, 20, 20), delay=1.0)]
-                save_profile(path, steps, loops=3, hotkeys_enabled=True)
-                loaded_steps, loaded_loops, loaded_hotkeys = load_profile(path)
+                save_profile(path, steps, loops=3, hotkeys_enabled=True, start_delay=2.5)
+                loaded_steps, loaded_loops, loaded_hotkeys, loaded_start_delay = load_profile(path)
                 self.assertEqual(loaded_loops, 3)
                 self.assertTrue(loaded_hotkeys)
+                self.assertEqual(loaded_start_delay, 2.5)
                 self.assertEqual(loaded_steps, steps)
 
         def test_engine_clicks_in_order(self):
@@ -805,15 +852,15 @@ def run_tests():
 
         def test_engine_pause_and_resume(self):
             clicks = []
-            proceed = {"allow_second": False}
 
             def click(x, y):
                 clicks.append((x, y))
                 if len(clicks) == 1:
                     engine.pause()
+
                     def release_pause():
-                        proceed["allow_second"] = True
                         engine.resume()
+
                     threading.Timer(0.05, release_pause).start()
                 elif len(clicks) == 2:
                     engine.stop()
@@ -844,6 +891,26 @@ def run_tests():
             engine.worker_thread.join(timeout=1)
             self.assertEqual(clicks, [(7, 7), (7, 7)])
             self.assertEqual(engine.completed_cycles, 2)
+            self.assertFalse(engine.is_running)
+
+        def test_engine_honors_start_delay(self):
+            status_updates = []
+            clicks = []
+            engine = MacroEngine(
+                click_func=lambda x, y: clicks.append((x, y)),
+                sleep_func=lambda s: time.sleep(min(s, 0.01)),
+                rng=random.Random(5),
+            )
+            steps = [Step(region=(9, 9, 9, 9), delay=0)]
+            engine.start(
+                steps,
+                loops=1,
+                start_delay=0.05,
+                on_status=status_updates.append,
+            )
+            engine.worker_thread.join(timeout=1)
+            self.assertEqual(clicks, [(9, 9)])
+            self.assertTrue(any("aguardando início" in item for item in status_updates))
             self.assertFalse(engine.is_running)
 
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(MacroTests)
